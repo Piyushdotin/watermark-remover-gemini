@@ -9,7 +9,8 @@
     "lint": "eslint",
     "test:engine": "tsx --test tests/watermark/engine.test.ts",
     "test:facade": "tsx --test tests/watermark/facade.test.ts",
-    "test:media": "tsx --test tests/media/phase2.test.ts"
+    "test:media": "tsx --test tests/media/phase2.test.ts",
+    "test:worker": "tsx --test tests/workers/pipeline.test.ts"
   },
   "dependencies": {
     "mediabunny": "^1.61.1",
