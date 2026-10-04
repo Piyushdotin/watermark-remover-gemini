@@ -10,7 +10,8 @@
     "test:engine": "tsx --test tests/watermark/engine.test.ts",
     "test:facade": "tsx --test tests/watermark/facade.test.ts",
     "test:media": "tsx --test tests/media/phase2.test.ts",
-    "test:worker": "tsx --test tests/workers/pipeline.test.ts"
+    "test:worker": "tsx --test tests/workers/pipeline.test.ts",
+    "test:controller": "tsx --test tests/processing/controller.test.ts"
   },
   "dependencies": {
     "mediabunny": "^1.61.1",
