@@ -106,6 +106,30 @@ export interface ValidatedRestorationRequest extends RestorationRequest {
 }
 
 /**
+ * Pipeline error code for the none-detected outcome. `detectFromSamples`
+ * returns null in that case; this mapping converts it to the stable
+ * machine-readable code the worker reports as `E-NO-WATERMARK-FOUND`.
+ */
+export const NO_WATERMARK_FOUND_CODE = "E-NO-WATERMARK-FOUND" as const;
+
+/**
+ * Convert a null detection into the pipeline error. Pass-through otherwise,
+ * so insufficient evidence can never silently become a restoration input.
+ */
+export function requireDetection(
+  result: WatermarkDetectionResult | null,
+  fileName = "media",
+): WatermarkDetectionResult {
+  if (result === null) {
+    throw new EngineError(
+      NO_WATERMARK_FOUND_CODE,
+      `${fileName} — no supported watermark pattern was confidently detected`,
+    );
+  }
+  return result;
+}
+
+/**
  * Restore only a CONFIDENT-validated ROI. Anything else throws
  * NOT_VALIDATED — the caller maps that to review/NO_WATERMARK handling.
  * Also rejects requests whose dimensions disagree with the validation.

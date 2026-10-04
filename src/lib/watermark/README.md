@@ -10,7 +10,9 @@ No external watermark-removal source is imported or depended upon.
 - `anchor-search.ts` — bounded local refinement + luma helper
 - `validator.ts` — CONFIDENT / UNCERTAIN / NONE tiers + restore gate
 - `restoration.ts` — inverse-alpha ROI solve (fresh output, input immutable)
-- `engine.ts` — stable facade (`detectFromSamples`, `restoreValidated`)
+- `engine.ts` — stable facade (`detectFromSamples`, `restoreValidated`,
+  `requireDetection`); the only module later phases may import
+- Contract types are canonical in `src/types/detection.ts`
 
 No React, no DOM, no worker or media-library imports.
 Tests: `tests/watermark/` (built-in `node:test`, `npm run test:engine`).

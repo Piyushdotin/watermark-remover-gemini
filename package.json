@@ -8,6 +8,7 @@
     "start": "next start",
     "lint": "eslint",
     "test:engine": "tsx --test tests/watermark/engine.test.ts",
+    "test:facade": "tsx --test tests/watermark/facade.test.ts",
     "test:media": "tsx --test tests/media/phase2.test.ts"
   },
   "dependencies": {

@@ -1,9 +1,18 @@
 // Engine-wide shared types. Types only — no runtime code.
 // The engine is framework-free: nothing here references React, Next.js,
 // DOM, media libraries, or worker APIs.
-
-/** Confidence tier assigned by the validator. Never inferred elsewhere. */
-export type DetectionTier = "CONFIDENT" | "UNCERTAIN" | "NONE";
+// Contract shapes (tier, profile, report) are canonical in
+// `src/types/detection.ts` and re-exported here for engine-internal use.
+import type {
+  DetectionTier,
+  WatermarkDetectionResult,
+  WatermarkProfile,
+} from "../../types/detection.js";
+export type {
+  DetectionTier,
+  WatermarkDetectionResult,
+  WatermarkProfile,
+} from "../../types/detection.js";
 
 /** Machine-readable engine failure modes. */
 export type EngineErrorCode =
@@ -11,7 +20,8 @@ export type EngineErrorCode =
   | "ALPHA_MISMATCH"
   | "UNSUPPORTED_PROFILE"
   | "NOT_VALIDATED"
-  | "NO_WATERMARK";
+  | "NO_WATERMARK"
+  | "E-NO-WATERMARK-FOUND";
 
 export class EngineError extends Error {
   readonly code: EngineErrorCode;
@@ -20,14 +30,6 @@ export class EngineError extends Error {
     this.name = "EngineError";
     this.code = code;
   }
-}
-
-/** Known watermark geometry profile (local project data, see profiles.ts). */
-export interface WatermarkProfile {
-  readonly id: string;
-  readonly size: number;
-  readonly rightMargin: number;
-  readonly bottomMargin: number;
 }
 
 /** Integer pixel rectangle, origin top-left. */
@@ -56,16 +58,6 @@ export interface ScoredCandidate extends DetectionCandidate {
 /** A candidate the validator has ruled on. */
 export interface ValidatedCandidate extends ScoredCandidate {
   readonly tier: DetectionTier;
-  readonly note?: string;
-}
-
-/** Report consumed by the pipeline and rendered verbatim by the UI. */
-export interface WatermarkDetectionResult {
-  readonly tier: DetectionTier;
-  readonly profileMatch: WatermarkProfile;
-  readonly anchorOffset: { readonly dx: number; readonly dy: number };
-  readonly scores: readonly number[];
-  readonly framesSampled: number;
   readonly note?: string;
 }
 
