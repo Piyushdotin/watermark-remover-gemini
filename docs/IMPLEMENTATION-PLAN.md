@@ -1,8 +1,11 @@
 # IMPLEMENTATION-PLAN — Build Order
 
 > Frozen inputs: `PRODUCT.md`, `DESIGN.md`, `UI-STATES.md`, `docs/HLD.md`, `docs/LLD.md`, `docs/TECHNICAL-SPIKE.md`, `AGENTS.md`. Direction C selected.
-> Frozen: browser-only; Next.js + TS + Tailwind; dedicated worker; mediabunny; vendored core + `WatermarkEnginePort`; no FFmpeg; no ONNX; incremental frames; real timestamps; MP4/AVC 12 Mbps CBR BT.709 2s-keyframes; audio copy-or-reason; BufferTarget; no size caps; capability probes; validated-evidence-only restoration.
-> Trusted watermark math is FROZEN — never redesigned. This plan makes no architectural decisions; it sequences the frozen ones.
+> Frozen: browser-only; Next.js + TS + Tailwind; dedicated worker; mediabunny; independent local watermark engine (profiles → detection → anchor search → validation → restoration); no FFmpeg; no ONNX; incremental frames; real timestamps; MP4/AVC 12 Mbps CBR BT.709 2s-keyframes; audio copy-or-reason; BufferTarget; no size caps; capability probes; validated-evidence-only restoration.
+> Frozen mathematical model (technique description only — no originality claimed, not a fork or port of anything):
+> `watermarked = alpha * logo + (1 - alpha) * original`, therefore
+> `original = (watermarked - alpha * logo) / (1 - alpha)`.
+> No external watermark-removal source may be vendored, copied, cloned, imported, or depended upon under any path. An external reference repository may be consulted as research material during development but is never an implementation dependency and is never mentioned in product copy.
 
 ## Phase dependencies
 
@@ -17,7 +20,7 @@
 
 ## Milestones
 
-- **M1 — First real success (end of Phase 6):** a small known MP4 enters the browser and yields a playable MP4 with the trusted engine applied, via a throwaway harness — no polished UI required.
+- **M1 — First real success (end of Phase 6):** a small known MP4 enters the browser and yields a playable MP4 with our local engine applied, via a throwaway harness — no polished UI required.
 - **M2 — Real pipeline + basic UI (end of Phase 13):** full state machine over the real pipeline with honest progress, comparison, download, and failure blocks; styling may be rough but tokens correct.
 - **M3 — Production UI + state handling (end of Phase 17):** Direction C faithfully executed across all 11 states, responsive, keyboard-operable, reduced-motion-safe.
 - **M4 — Hardened + deployable (end of Phase 18):** performance/compat evidence recorded, deploy checklist green.
@@ -27,24 +30,31 @@
 ## PHASE 0 — Repository preparation
 
 - **Objective:** make the scaffold capable of holding the frozen architecture without touching product behavior.
-- **Files/modules:** `tsconfig.json` (strict), `next.config.ts`, `.gitignore`, `src/**` skeleton dirs, lint rule stub location (ban list documented, enforced in Phase 1).
+- **Files/modules:** `tsconfig.json` (strict), `next.config.ts`, `.gitignore`, `src/**` skeleton dirs, lint rule stub location (ban list documented, enforced from Phase 1).
 - **Prerequisites:** frozen docs listed above.
 - **Deliverables:** `src/{app,components,lib/{media,watermark,processing},workers,types}/` skeleton with barrel READMEs; TS strict on; worker-compatible build config verified (`next dev` compiles a `new Worker()` stub).
 - **Tests:** `tsc --noEmit` passes; dev server boots.
 - **Acceptance:** empty skeleton builds; no runtime behavior changed.
 - **Failure modes:** worker bundling misconfig (Next.js worker postfix) — resolve config before proceeding, do not restructure phases.
-- **MUST NOT touch:** `app/page.tsx` product surface (may only re-export shell later), any upstream algorithm, dependency set.
+- **MUST NOT touch:** `app/page.tsx` product surface (may only re-export shell later), the frozen mathematical model, dependency set. No external watermark-removal code under any path.
 
-## PHASE 1 — Vendor trusted engine subset
+## PHASE 1 — Independent watermark engine
 
-- **Objective:** pin the exact upstream files from `TECHNICAL-SPIKE.md` §3 at a recorded commit, with attribution, behind an import barrier.
-- **Files/modules:** `src/vendor/watermark-core/**` (core subset + `videoWatermarkDetector/Catalog/Metadata/DecodeRecovery` helpers only), `src/vendor/NOTICE.md` (commit hash, file list, MIT holders © 2025 Jad / © 2024 AllenK), lint rule banning imports from `src/vendor` except via `lib/watermark/enginePort.ts`.
+- **Objective:** build our own watermark engine from the frozen mathematical specification. Nothing is vendored, copied, cloned, or imported from any external watermark-removal source.
+- **Files/modules:** `lib/watermark/profiles.ts`, `lib/watermark/detector.ts`, `lib/watermark/anchor.ts` (local anchor search), `lib/watermark/validator.ts`, `lib/watermark/restoration.ts`, `lib/watermark/types.ts`, `types/detection.ts`.
 - **Prerequisites:** Phase 0.
-- **Deliverables:** vendored files byte-identical to upstream commit; `NOTICE.md`; lint rule active; `tsc` passes over vendored JS (via `allowJs`/d.ts shim — no logic edits).
-- **Tests:** checksum/file-list test vs recorded manifest; no-network-import scan of `src/vendor` + `src/lib` (fail on `node:`, `sharp`, `fetch`).
-- **Acceptance:** manifest test green; zero logic diffs vs upstream (diff audit recorded).
-- **Failure modes:** missing transitive core import (pipeline file pulling denoise chain) — vendor the missing pure file or shim the import, never stub math.
-- **MUST NOT touch:** vendored file contents (formatting included); `src/sdk/video.js` (Node-only — never vendor).
+- **Deliverables:**
+  1. Watermark profile model — known size/position profiles as local data (e.g. 96×96 @ +64/+64, 48×48 @ +32/+32) with provenance notes.
+  2. Detection geometry — dimension-catalog candidate resolution plus sampled-frame scoring (tiers CONFIDENT / UNCERTAIN / NONE).
+  3. Local anchor search — pixel-level refinement around predicted regions.
+  4. Validation — restoration consumes only validated geometry; uncertain geometry stays UNCERTAIN with a `VERIFY EDGES` caution; absent geometry resolves to NONE.
+  5. Inverse-alpha restoration — per-ROI implementation of the frozen model, identical-dims in/out, input never mutated.
+  6. Unit tests — geometry, tier mapping, identical-dims restoration, input-immutability, no-magic-constants (every constant cited to spec or measurement).
+  7. Local regression fixtures — fixtures generated inside this project for this project; quality judged against the mathematical expectation.
+- **Tests:** unit suite per deliverable; code-origin scan (fail on any import from an external watermark-removal package or any `src/vendor`-style path, which must not exist); fixture-validation report recorded.
+- **Acceptance:** all stage tests green; zero external watermark-removal references in `src/`; engine exposes `detect → report` and `restore(roi, geometry) → roi`.
+- **Failure modes:** ambiguous geometry — demote tier, never silently promote; missing profile — tier NONE, never invented constants.
+- **MUST NOT touch:** the mathematical model itself; media pipeline; any UI state. No external code, assets, names, tests, or fixtures may enter the tree.
 
 ## PHASE 2 — Media capability layer
 
@@ -55,22 +65,22 @@
 - **Tests:** unit tests on metadata fallbacks with fixture MP4s (small, with/without audio, portrait); capability test mocks (missing Worker, missing OffscreenCanvas, encode-probe false).
 - **Acceptance:** real MP4 probes to correct dims/codec/duration on Chrome; missing-capability paths return named `E-CAPABILITY` inputs.
 - **Failure modes:** `canEncodeVideo` false-positives on some browsers — treat probe as necessary-not-sufficient; encode failure still maps to named error downstream.
-- **MUST NOT touch:** vendored core; UI; worker topology.
+- **MUST NOT touch:** engine internals; UI; worker topology.
 
-## PHASE 3 — Watermark engine adapter
+## PHASE 3 — Watermark engine interface
 
-- **Objective:** thin `WatermarkEnginePort` isolating trusted math behind the LLD interface; the only module allowed to import `src/vendor`.
-- **Files/modules:** `lib/watermark/enginePort.ts`, `lib/watermark/types.ts` (re-export), `types/detection.ts`.
+- **Objective:** stable local engine facade with no React dependency: `detect → report`, `restore → ROI`.
+- **Files/modules:** `lib/watermark/engine.ts` (facade over detector/validator/restoration), `lib/watermark/types.ts`, `types/detection.ts`.
 - **Prerequisites:** Phase 1.
-- **Deliverables:** `detectFromSamples(frames) → WatermarkDetectionResult` (12-sample protocol, tiers CONFIDENT/UNCERTAIN/NONE); `restoreRoi(roi, geometry) → roi` (identical dims, ROI-only); `E-NO-WATERMARK-FOUND` mapping for tier NONE.
-- **Tests:** parity tests vs reference outputs on still fixtures (ROI byte-compare within tolerance documented in test); tier-mapping tests; identical-dims assertion tests.
-- **Acceptance:** parity green; adapter imports are the sole `src/vendor` consumers repo-wide (lint test).
-- **Failure modes:** alpha-map variant mismatch (48/96/36-v2/outline) — surface as test failure, never patched with invented constants; re-check vendored manifest.
-- **MUST NOT touch:** vendored contents; detection thresholds; any UI state.
+- **Deliverables:** `detectFromSamples(frames) → WatermarkDetectionResult` (sampled protocol, tiers CONFIDENT/UNCERTAIN/NONE); `restoreRoi(roi, geometry) → roi` (identical dims, ROI-only); `E-NO-WATERMARK-FOUND` mapping for tier NONE.
+- **Tests:** tier-mapping tests; identical-dims assertion tests; no-mutation tests; Phase 1 fixture suite stays green.
+- **Acceptance:** interface tests green; the worker consumes only this facade.
+- **Failure modes:** ambiguous geometry — surface as test failure with tier demotion, never patched with invented constants.
+- **MUST NOT touch:** the mathematical model; tier semantics; any UI state.
 
 ## PHASE 4 — Video worker
 
-- **Objective:** Dedicated Worker running `validate → analyze → restore → mux` per the LLD protocol, reusing the upstream pipeline shape on a worker thread.
+- **Objective:** Dedicated Worker running `validate → analyze → restore → mux` per the LLD protocol, calling the Phase 1 engine on a worker thread.
 - **Files/modules:** `workers/pipeline.worker.ts`, `lib/media/pipeline.ts` (worker-side demux/decode/encode/mux), `lib/media/timestamps.ts`, `lib/media/audio.ts`, `types/protocol.ts`.
 - **Prerequisites:** Phases 2 + 3.
 - **Deliverables:** command handler (`validate/analyze/restore/cancel`) with `jobId+generation+seq`; fixed export config (AVC 12 Mbps CBR, quality, BT.709, 2 s keyframes, `fastStart in-memory`); audio copy-or-`skipReason`; `BufferTarget` finalize + non-empty assertion; per-frame abort checks; `sample.close()` discipline.
@@ -181,10 +191,10 @@
 ## PHASE 14 — Testing
 
 - **Objective:** lock the suite that guards every phase's contract.
-- **Files/modules:** `tests/**` (manifest/parity, protocol, controller, statechart, rendering, a11y), CI config if present.
+- **Files/modules:** `tests/**` (engine unit/fixture validation, protocol, controller, statechart, rendering, a11y), CI config if present.
 - **Prerequisites:** Phase 13 (but per-phase tests were written in their phases — this phase integrates + fills gaps).
-- **Deliverables:** full `tsc + lint + test` green; network-import ban test; vendor-manifest test; parity fixtures documented.
-- **Tests:** the suite itself; coverage focuses on boundaries (vendor barrier, worker protocol, URL registry, state exits).
+- **Deliverables:** full `tsc + lint + test` green; network-import ban test; external-code-origin scan (no external watermark-removal code anywhere in `src/`); local fixture-validation report recorded.
+- **Tests:** the suite itself; coverage focuses on boundaries (engine isolation, worker protocol, URL registry, state exits).
 - **Acceptance:** one command reproduces green; flaky worker-timing tests quarantined with fixed seeds/timeouts.
 - **Failure modes:** long-video tests timing out in CI — mark extended, keep short fixtures in the default run.
 - **MUST NOT touch:** product behavior to satisfy tests (fix code, not expectations, unless spec-cited).
@@ -202,7 +212,7 @@
 
 ## PHASE 16 — Browser compatibility testing
 
-- **Objective:** prove the support contract (§6 matrix) on real browsers.
+- **Objective:** prove the support contract on real browsers.
 - **Files/modules:** compat matrix doc (test sheet), capability-probe verification.
 - **Prerequisites:** Phase 15.
 - **Deliverables:** Chrome/Edge current: full pass (MP4/H.264 in→out, audio copy, 4K short). Firefox/Safari: probe-gated results recorded (pass or named `E-CAPABILITY`/`UNSUPPORTED` — both are correct outcomes if truthful).
@@ -237,11 +247,11 @@
 
 ## Implementation Invariants
 
-1. Trusted math stays frozen: consume via `WatermarkEnginePort`; no threshold, constant, or algorithm edits; vendor diffs only by pinned upstream sync with recorded rationale.
+1. Mathematical model stays frozen exactly as specified above; engine is implemented locally in `lib/watermark/*` with no external watermark-removal source under any path — no copying, vendoring, cloning, forking, porting, or package dependency; no originality claims about the method.
 2. One job, one worker, terminated after use; zombie-guard every worker event; single `UiState` source of truth; no auto-advance into `PROCESSING`, no auto-download from `COMPLETE`.
 3. Incremental frames, ROI-only restoration, real timestamps, nullable totals/ETA; `COMPLETE` only after verified non-empty mux finalize; original `File` never mutated.
 4. Fixed export profile (MP4/AVC 12 Mbps CBR, BT.709, 2 s keyframes) + audio copy-or-stated-reason; no bitrate UI, no FFmpeg, no ONNX in V1.
 5. `DESIGN.md` is the only visual authority: one viewer card, flat rail, strict type roles, scoped accent/danger/amber, no new colors/elevations/hero/cards/pills-as-buttons.
 6. Every number rendered is measured or labeled unknown; failures name file + reason + `E-CODE`, state preservation precisely, and offer exactly one primary recovery.
 7. Local-only is structural: no backend/DB/auth/storage; no media-byte network traffic; capability failures resolve to named `E-CAPABILITY`/`UNSUPPORTED`, never silent degradation.
-8. Small scoped changes per phase with checks green (`tsc`, lint incl. import bans, relevant tests) before advancing; never modify unrelated files or expand scope without written approval.
+8. Small scoped changes per phase with checks green (`tsc`, lint incl. import bans — covering `node:*`, media-byte network calls, and external watermark-removal code — plus relevant tests) before advancing; never modify unrelated files or expand scope without written approval.

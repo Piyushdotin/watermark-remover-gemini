@@ -10,13 +10,20 @@ This block is written and re-added by `next dev` — verify at `node_modules/nex
 
 # AGENTS — Implementation Contract: Browser Video Restoration Utility
 
-Read before substantial changes: `PRODUCT.md`, `DESIGN.md`, `UI-STATES.md`, `docs/HLD.md`, `docs/LLD.md`, `docs/DESIGN-DIRECTIONS.md` (Direction C selected).
+Read before substantial changes: `PRODUCT.md`, `DESIGN.md`, `UI-STATES.md`, `docs/HLD.md`, `docs/LLD.md`, `docs/TECHNICAL-SPIKE.md`, `docs/IMPLEMENTATION-PLAN.md`, `docs/DESIGN-DIRECTIONS.md` (Direction C selected).
 
 ## PRODUCT RULES
 - Preserve the linear workflow `EMPTY → FILE_SELECTED → VALIDATING → ANALYZING → READY → PROCESSING → COMPLETE` plus `ERROR / CANCELLED / UNSUPPORTED / NO_WATERMARK`. No auto-advance into `PROCESSING`, no auto-download from `COMPLETE`.
 - One file, one job, one result per session. No batch/queue, no accounts/backend/database/storage, no sharing links, no enhancement features.
-- Never touch the trusted watermark math: consume its report/artifacts through the engine port only.
+- Preserve the frozen mathematical model (`original = (watermarked - alpha * logo) / (1 - alpha)`); implement it locally in `lib/watermark/*`. Never claim the technique is proprietary or invented by this project.
 - Never mutate the user's original `File`; `NO_WATERMARK`/failures leave the source byte-identical.
+
+## ENGINE INDEPENDENCE RULES (hard prohibitions)
+- Implement the watermark engine locally. Never copy, clone, fork, port, vendor, or import external watermark-removal source code, assets (including alpha maps), tests, or fixtures.
+- Never add an external watermark-removal package dependency or a `src/vendor`-style directory for watermark code.
+- Never introduce a source-code adapter for external implementations; the worker consumes only the local `lib/watermark/engine.ts` facade.
+- Never silently change algorithm constants or behaviour — every constant cites the spec or a measurement; output changes re-baseline explicitly with rationale.
+- Required tests: mathematical correctness, synthetic fixtures, detection/validation tiers, restoration regression, input-immutability, boundary isolation, video integration.
 
 ## DESIGN RULES
 - `DESIGN.md` is the visual source of truth: warm paper `#F4F1EA`, ink `#1C1A16`, accent `#2F5D3A` (primary/progress only), danger/amber strictly scoped. No new colors without documented reason.
@@ -30,11 +37,12 @@ Read before substantial changes: `PRODUCT.md`, `DESIGN.md`, `UI-STATES.md`, `doc
 - Incremental frame flow; ROI-only engine calls; nullable totals stay null. No full-video buffering, no invented FPS/ETA/percentages/confidence.
 - Workers are single-job and terminated after use; zombie-guard all worker events (`jobId` + generation + `seq`).
 - `COMPLETE` only after verified mux finalize with non-empty bytes. Cancellation revokes partial URLs, keeps source, states no-resume.
+- No FFmpeg and no ONNX/model-based cleanup in V1; no backend/database/auth/cloud media processing; avoid unnecessary dependencies.
 
 ## CODE CHANGE RULES
 - Inspect before editing (`read`/`grep` first); make scoped minimal changes; never modify unrelated files or silently change product behavior.
 - Prefer small coherent commits; run typecheck/lint and relevant tests after changes; do not install dependencies or add new ones without explicit approval.
-- Do not replace working architecture (media library, worker topology, engine port) without written justification + approval.
+- Do not replace working architecture (media library, worker topology, local engine facade) without written justification + approval.
 
 ## TRUST / DATA RULES
 - Never claim upload when local; never claim local if a change introduces any network transfer of media (that requires explicit re-approval of the privacy model).

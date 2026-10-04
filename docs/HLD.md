@@ -1,8 +1,10 @@
 # HLD — High-Level Design: Browser Video Restoration Utility
 
-> Scope: surrounding system only. The reverse-alpha restoration math is a **trusted boundary** — not redesigned, not re-derived.
-> Product: `PRODUCT.md` · Visual: `DESIGN.md` · States: `UI-STATES.md` · Exploration: `docs/DESIGN-DIRECTIONS.md`
-> Reference findings below come from inspecting `~/Desktop/gemini-watermark-remover` (the trusted upstream repo).
+> Scope: the full system. The watermark engine is an **independent local implementation** written in this project from the frozen mathematical model below.
+> Product: `PRODUCT.md` · Visual: `DESIGN.md` · States: `UI-STATES.md` · Plan: `docs/IMPLEMENTATION-PLAN.md`
+> Frozen model (technique description only — no originality claimed, not a fork or port of anything):
+> `watermarked = alpha * logo + (1 - alpha) * original`, therefore
+> `original = (watermarked - alpha * logo) / (1 - alpha)`.
 
 ## 1. System context
 
@@ -16,20 +18,24 @@ A single-page Next.js app running 100% in the browser. No backend, database, aut
 │                                                              │
 │  ┌──────────┐   commands    ┌──────────────────────┐        │
 │  │ React UI │ ────────────► │ ProcessingController │        │
-│  │ ( Pascal │ ◄──────────── │ (main-thread owner   │        │
-│  │  viewer  │    events     │  of job state)        │        │
-│  │  + rail) │               └─────────┬────────────┘        │
-│  └──────────┘                         │ postMessage         │
+│  │ (viewer  │ ◄──────────── │ (main-thread owner   │        │
+│  │  + rail) │    events     │  of job state)        │        │
+│  └──────────┘               └─────────┬────────────┘        │
+│                                       │ postMessage         │
 │                              ┌────────▼────────┐            │
-│                              │  Worker pipeline │            │
+│                              │ Dedicated Worker │            │
 │                              │  ┌────────────┐  │            │
 │                              │  │Media pipe  │  │            │
-│                              │  │(demux/dec) │  │            │
+│                              │  │in/demux/dec│  │            │
 │                              │  └─────┬──────┘  │            │
 │                              │  ┌─────▼──────┐  │            │
-│                              │  │ Trusted    │  │            │
-│                              │  │ watermark  │  │            │
-│                              │  │ engine     │  │            │
+│                              │  │Independent │  │            │
+│                              │  │watermark   │  │            │
+│                              │  │engine      │  │            │
+│                              │  │profiles→   │  │            │
+│                              │  │detect→     │  │            │
+│                              │  │validate→  │  │            │
+│                              │  │restore     │  │            │
 │                              │  └─────┬──────┘  │            │
 │                              │  ┌─────▼──────┐  │            │
 │                              │  │Encoder/    │  │            │
@@ -40,15 +46,15 @@ A single-page Next.js app running 100% in the browser. No backend, database, aut
 └──────────────────────────────────────────────────────────────┘
 ```
 
-UI ↔ controller is synchronous calls + subscription. Controller ↔ worker is `postMessage` only. Inside the worker, media → engine → encoder run incrementally, one frame at a time.
+UI ↔ controller is synchronous calls + subscription. Controller ↔ worker is `postMessage` only. Inside the worker: media → engine → encoder run incrementally, one frame at a time.
 
 ## 3. Major components
 
 1. **UI shell** (React): viewer + rail + transport + compare + export per `DESIGN.md`/`UI-STATES.md`.
 2. **ProcessingController** (main thread): owns job lifecycle, worker lifetime, object URLs, throttled progress → UI state mapping.
-3. **Pipeline worker** (Web Worker): demux → decode → detect → restore → encode → mux. All heavy work lives here so the UI stays at 60fps.
-4. **Media pipeline adapter**: demux/decode/encode/mux via the media library; exposes frames + timestamps + metadata, hides container details.
-5. **Trusted watermark engine adapter**: thin wrapper translating pipeline frames ↔ engine calls and engine verdicts ↔ `WatermarkDetectionResult`. Math inside is opaque.
+3. **Pipeline worker** (Web Worker): demux → decode → detect → restore → encode → mux. All heavy work lives here so the UI stays responsive.
+4. **Media pipeline**: input/demux, decoding, timestamps, frame orchestration, encoding, audio handling, muxing via the media library; exposes frames + timestamps + metadata, hides container details.
+5. **Independent watermark engine**: our own profiles, detection, local anchor search, validation, and restoration, built from the frozen model. Receives geometry + pixels, returns verdicts + restored pixels.
 6. **Output sink**: collects the muxed bytes → `Blob` → download URL.
 
 ## 4. Responsibilities of each component
@@ -56,8 +62,8 @@ UI ↔ controller is synchronous calls + subscription. Controller ↔ worker is 
 - **UI shell**: render one state at a time; dispatch user intents (`select`, `restore`, `cancel`, `download`, `reset`); never touches pixels, frames, or engine math.
 - **ProcessingController**: single owner of `ProcessingJob`; creates/terminates the worker; forwards commands; converts worker events to UI states; owns all object-URL lifetimes; enforces "one job at a time."
 - **Pipeline worker**: executes phases `validate → analyze → restore → mux` sequentially; emits measured progress; honors cancellation promptly; releases frame memory per frame.
-- **Media adapter**: capability checks (`canEncodeVideo`-style probes), metadata extraction, sample iteration with decoder recovery, audio packet copy.
-- **Engine adapter**: detection call (frames in → report out), per-frame restore call (ROI pixels in → restored ROI out). No React, no DOM, no worker API imports.
+- **Media pipeline**: capability checks (`canEncodeVideo`-style probes), metadata extraction, sample iteration with decoder recovery, timestamp normalization, audio packet copy, encode + mux.
+- **Watermark engine**: profile lookup (frames in → candidates out), detection + anchor refinement (samples in → report out), per-frame restore (validated ROI in → restored ROI out). No React, no DOM, no worker API imports, no media-library imports.
 - **Output sink**: assembles final bytes only after encoder/muxer actually finalize; produces the only artifact the UI may offer for download.
 
 ## 5. Main data flow
@@ -77,21 +83,21 @@ UI ↔ controller is synchronous calls + subscription. Controller ↔ worker is 
 
 ## 8. Media pipeline
 
-- **WHAT:** demux/decode with a browser media library (reference uses **mediabunny**: `Input`, `VideoSampleSink`, `Output`, `Mp4OutputFormat`, `EncodedPacketSink`), `OffscreenCanvas` for frame rasterization, `VideoSampleSink.draw` → 2d context → ROI `ImageData`.
+- **WHAT:** demux/decode with a browser media library (**mediabunny**: `Input`, `VideoSampleSink`, `Output`, `Mp4OutputFormat`, `EncodedPacketSink`), `OffscreenCanvas` for frame rasterization, sample-sink draw → 2d context → ROI `ImageData`.
 - **WHY:** raw `<video>` + captureStream cannot give deterministic per-frame access with timestamps; a sample-sink model yields exact frames + `timestamp/duration` pairs needed for honest progress and A/V correctness.
-- **BOUNDARY:** pipeline exposes `metadata`, `sample(i)`, `restore(frame)`, `encode(frame)`; the engine sees only `ImageData` ROIs.
+- **BOUNDARY:** pipeline exposes `metadata`, `sample(i)`, `encode(frame)`; the engine sees only `ImageData` ROIs plus geometry. The pipeline never interprets watermark content; the engine never touches containers, codecs, or mux state.
 - **TRADEOFF:** library dependency (~codec coverage limited to what the browser/library supports) vs. hand-rolled MSE/WebCodecs plumbing — library wins for v1 determinism.
 
-## 9. Trusted watermark-engine boundary
+## 9. Watermark-engine boundary
 
-- **WHAT:** engine is vendored/adapted from the reference `src/core` (pure functions over `ImageData` + embedded alpha maps) behind `WatermarkEnginePort` (`detect(frames) → report`, `restoreFrame(roi) → roi`).
-- **WHY:** math is validated upstream; any rewrite risks quality regressions and violates the product contract.
-- **BOUNDARY:** engine receives pixels + geometry, returns pixels + verdict; it never sees `File`, `Blob`, React state, worker messaging, or DOM. UI never sees alpha maps or blend equations — only the `WatermarkDetectionResult` report.
-- **TRADEOFF:** vendored code must be kept in sync with upstream deliberately (pinned snapshot + changelog note) vs. live dependency — snapshot wins for determinism.
+- **WHAT:** our own engine in `lib/watermark/` — profiles, detector, local anchor search, validator, restoration — implementing the frozen inverse-alpha model (`detect(samples) → report`, `restore(roi, geometry) → roi`).
+- **WHY:** the engine must be owned by this project: no external source to drift, audit, or license-check at runtime; the mathematics is fixed, so a local implementation is fully specified and testable against that specification.
+- **BOUNDARY:** engine receives pixels + geometry, returns pixels + verdict; it never sees `File`, `Blob`, React state, worker messaging, media-library objects, or DOM. UI never sees blend equations — only the `WatermarkDetectionResult` report.
+- **TRADEOFF:** we own correctness proof (mathematical + fixture tests in Phase 1) instead of inheriting it — more upfront test work, zero runtime coupling.
 
 ## 10. Detection/reporting boundary
 
-- **WHAT:** `ANALYZING` consumes N sampled frames (reference: 12) and returns `WatermarkDetectionResult { catalogMatch, anchorOffset, tier, scores }`. Tiers: confident / uncertain / none.
+- **WHAT:** `ANALYZING` consumes N sampled frames and returns `WatermarkDetectionResult { profileMatch, anchorOffset, tier, scores }`. Tiers: confident / uncertain / none.
 - **WHY:** full-video scan before consent wastes minutes; sampling bounds analysis cost while the report gates `READY` vs `NO_WATERMARK`.
 - **BOUNDARY:** detector output is data, not pixels — the rail renders it verbatim; restoration consumes only a validated (confident/uncertain-acknowledged) report.
 - **TRADEOFF:** sampling can miss edge cases → uncertain tier + `VERIFY EDGES` caution + full-run per-frame scoring as backstop.
@@ -110,11 +116,11 @@ User `cancel` → controller posts `cancel` + sets a local `cancelled` generatio
 
 ## 14. Output generation
 
-Encoder (default: AVC ~12 Mbps constant-bitrate, quality-latency, BT.709, keyframe interval ~2s — matching reference calibrated profile) consumes restored frames in timestamp order; muxer interleaves copied audio packets; **finalize is explicit** — `COMPLETE` publishes only after mux close + byte-size > 0 verified. Optional PNG still is captured from the restored viewer frame, not re-processed.
+Encoder (AVC ~12 Mbps constant-bitrate, quality-latency, BT.709, keyframe interval ~2s) consumes restored frames in timestamp order; muxer interleaves copied audio packets; **finalize is explicit** — `COMPLETE` publishes only after mux close + byte-size > 0 verified. Optional PNG still is captured from the restored viewer frame, not re-processed.
 
 ## 15. Audio handling
 
-Default: **encoded-packet copy** of the primary audio track when the output container supports its codec (reference: `EncodedAudioPacketSource` + timestamp normalization); otherwise omit audio with a stated `skipReason` (`no-audio-track`, `unsupported-audio-codec`, `no-audio-packets`, `disabled`). Never transcode audio in v1 (cost without product benefit); never desync — packets keep normalized timestamps relative to the same start as video.
+Default: **encoded-packet copy** of the primary audio track when the output container supports its codec; otherwise omit audio with a stated `skipReason` (`no-audio-track`, `unsupported-audio-codec`, `no-audio-packets`, `disabled`). Never transcode audio in v1 (cost without product benefit); never desync — packets keep normalized timestamps relative to the same start as video.
 
 ## 16. Metadata/timestamp handling
 
@@ -126,7 +132,7 @@ Incremental: at most a small window of decoded frames alive (current + in-flight
 
 ## 18. Browser capability checks
 
-At startup (and pre-restore): Worker availability, `OffscreenCanvas` (fallback: document canvas on main thread with degraded-performance notice), `canEncodeVideo`-style codec probe for the export profile, `postMessage` structured-clone of needed types. Failure → `ERROR`/`UNSUPPORTED` with the exact missing capability named. Note: reference threaded-WASM denoise path needs COOP/COEP headers — our v1 excludes that path (see §25), so no special headers required.
+At startup (and pre-restore): Worker availability, `OffscreenCanvas` (fallback: document canvas on main thread with degraded-performance notice), `canEncodeVideo`-style codec probe for the export profile, `postMessage` structured-clone of needed types. Failure → `ERROR`/`UNSUPPORTED` with the exact missing capability named. V1 uses no `SharedArrayBuffer` path, so no special headers are required.
 
 ## 19. Performance strategy
 
@@ -155,24 +161,18 @@ No telemetry/analytics of media. Observable surface = the on-screen audit trail 
 - Main-thread decode fallback only with explicit degraded notice.
 - No fixed-FPS assumption; nullable totals/ETAs.
 - `COMPLETE` requires actual mux finalization.
+- No external watermark-removal code under any path — enforced by code-origin scan (see §20 lint rule, extended to external watermark-removal packages).
 
 ## 25. Non-goals
 
-No backend/DB/auth/storage/API; no batch; no enhancement/upscale/denoise-by-default (reference's `allenk-fdncnn` ONNX/WASM cleanup backends are explicitly excluded from v1 — heavy models + COOP/COEP threading requirements, no product need); no audio transcoding; no general watermark removal; no extension/CLI/userscript surfaces in this app.
+No backend/DB/auth/storage/API; no batch; no enhancement/upscale/denoise-by-default (no model-based cleanup backends in v1 — heavy models + threading requirements, no product need); no audio transcoding; no general watermark removal; no extension/CLI/userscript surfaces in this app.
 
 ## 26. Future extension points
 
-Bitrate/profile selector (iff engine exposes alternatives); additional containers if the media library gains them; optional cleanup backends behind a capability flag (with COOP/COEP story resolved); side-by-side export still; all without touching the trusted engine interface or the UI↔controller contract.
+Bitrate/profile selector (iff our engine exposes alternatives); additional containers if the media library gains them; optional cleanup backends behind a capability flag; side-by-side export still; all without changing the engine facade or the UI↔controller contract.
 
 ---
 
-## Reference analysis (upstream `~/Desktop/gemini-watermark-remover`)
+## Research note (not a runtime dependency)
 
-- **Browser/video architecture:** browser-first via `src/video/` + `src/sdk/video.js` + `src/video-app.js`; page/worker/userscript runtimes under `src/page`, `src/workers`, `src/runtime`.
-- **Media library:** `mediabunny` (sole runtime dependency) — `Input`/`Output`, `VideoSampleSink`, `EncodedPacketSink`, `Mp4OutputFormat`, `canEncodeVideo`. Default export: 12 Mbps AVC constant-bitrate, quality latency, BT.709, 2s keyframes. Audio: primary-track encoded-packet copy w/ timestamp normalization + stated skip reasons.
-- **Browser-safe:** `src/core` (pure `ImageData` math + embedded alpha maps), `src/video` (OffscreenCanvas w/ document-canvas fallback), `src/sdk/{browser,image-data,video}`, `src/workers/watermarkWorker.js`. Detection: dimension-catalog candidates → 12 sampled frames → async scoring (5 alpha-refinement rounds, thresholds 0.14/0.035).
-- **Node-only (must NOT enter browser bundle):** `src/cli`, `sharp` (peer dep for file decode/encode), `node:fs/http/path/url` preview server + Playwright harness inside `src/sdk/video.js` (`removeVideoWatermarkFromFile/Buffer`, local COOP/COEP server), `scripts/`, `tests/`, `bin/`.
-- **Reuse conceptually:** sample-then-detect flow, packet-copy audio, timestamp normalization, decode-recovery iteration, metadata fallbacks (duration → computed → null; fps fallback 30; nullable frame estimate).
-- **Do NOT copy:** CLI/userscript/extension/page-hook machinery, Node preview server, denoise/ONNX model stack for v1, Playwright harnesses.
-- **Assumptions upstream makes:** MP4/AVC-first output, audio copy-if-compatible, display-dims-aware geometry, VFR-tolerant timing, decode can fail mid-stream (recovery path exists).
-- **Compat constraints:** threaded WASM (denoise) needs COOP/COEP + SharedArrayBuffer; core + mediabunny path needs Worker + (Offscreen)Canvas + encodable AVC — the v1 capability gate.
+External watermark-removal repositories may be consulted as **research material** during development (to understand problem shape, e.g. catalog-style profiles or packet-copy audio patterns). They are never implementation dependencies: no source, assets, tests, fixtures, names, or packages flow into this project. No external repository is named in product architecture or product copy.

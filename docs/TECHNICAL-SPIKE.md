@@ -1,157 +1,205 @@
-# TECHNICAL-SPIKE — Pre-Implementation Findings
+# TECHNICAL-SPIKE — Technical Findings for Our Implementation
 
-> Read-only investigation. No application code written, no dependencies installed, no app files modified.
-> Inspected: `~/Desktop/gemini-watermark-remover` (upstream, v1.0.46, MIT) and the current scaffold (`/Users/piyushkumar/watermark-remover-gemini`, no `src/` yet, no `mediabunny` in `package.json`).
-> Note: upstream `node_modules` is absent, so installed-package surfaces (mediabunny typings) could not be enumerated — flagged where relevant.
+> Design-time analysis for the independent local watermark engine and its
+> browser video pipeline. No application code written, no dependencies
+> installed. This document describes technique and architecture directly.
+> The watermark engine is implemented locally in this project; there is no
+> external watermark-removal source dependency of any kind.
 
-## 1. Executive summary
+## 1. Browser-only architecture
 
-- The trusted core (`src/core`) is **fully browser-safe pure JS** (only `ImageData`/`Float32Array` math + embedded base64 alpha maps); zero `node:` imports anywhere under `src/core`, `src/video`, `src/workers`, `src/shared`, `src/runtime`.
-- The **only** `node:` imports in SDK-adjacent code are `src/sdk/node.js` and `src/sdk/video.js` (which is a **Node-only** module despite its name — preview server + Playwright harness). There is **no browser-safe video entry point** in the package exports; `src/sdk/video.js` must never be imported into the browser bundle.
-- Video I/O is **mediabunny-only** (sole runtime dependency): `Input`/`BlobSource`/`ALL_FORMATS` in, `VideoSampleSink` frames, `CanvasSource` + AVC `Output`/`Mp4OutputFormat`/`BufferTarget` out, `EncodedAudioPacketSource`/`EncodedPacketSink` audio copy. No FFmpeg anywhere. Default export = **12 Mbps AVC CBR, quality-latency, BT.709, 2 s keyframes** — directly reproducible.
-- Denoise/ONNX defaults to **off** (`DEFAULT_DENOISE_BACKEND = 'none'`); the normal path does not need it.
-- Output is held via **`BufferTarget` (whole file in memory)** upstream; V1 keeps that model with a chunked/streaming migration path.
-- Recommendation: **vendored pinned snapshot of the browser-safe subset + thin local adapter** (approach C), Chrome/Edge-first support contract, no bitrate selector, no size cap — practical guidance only.
+Single-page Next.js app, 100% client-side: `File` in via picker/drop,
+processing in-memory in a Dedicated Worker, restored `Blob` out via
+user-initiated download. No backend, database, auth, storage, or API layer;
+no network transfer of media bytes on the job path. The page must complete a
+job after load with zero media network traffic.
 
-## 2. Reference dependency graph
+## 2. Independent watermark engine
 
-```
-BROWSER-SAFE (no node:, no sharp, no onnxruntime-web import at module top-level)
-├── src/core/  (~60 files: pure math over ImageData/Float32Array)
-│   ├── blendModes.js                    ← reverse-alpha removeWatermark (per-frame primitive)
-│   ├── watermarkEngine.js               ← WatermarkEngine (OffscreenCanvas first, document fallback)
-│   ├── watermarkProcessor.js            ← processWatermarkImageData (imports core/* only)
-│   ├── adaptiveDetector.js / candidateSelector.js / geminiSizeCatalog.js / restorationMetrics.js …
-│   ├── embeddedAlphaMaps.js (+ embedded{,Dark}OutlineAlphaMap.js, base64 blobs)
-│   └── multiPassRemoval.js / imageWatermarkPipeline*.js …
-├── src/video/ (browser-safe, mediabunny + canvas)
-│   ├── videoExport.js                   ← removeGeminiVideoWatermark (imports mediabunny)
-│   ├── videoWatermarkDetector.js        ← 12-sample detect (imports core adaptiveDetector + catalog)
-│   ├── videoWatermarkCatalog.js / veoTextWatermark*.js / videoMetadata.js
-│   ├── videoDecodeRecovery.js / videoDenoiseRuntimePolicy.js / videoPresetPolicy.js
-│   └── videoCleanupBackends.js          ← canvas cleanups inline; ONNX isolated (see §11)
-├── src/workers/watermarkWorker.js       ← image-only worker (WatermarkEngine + createImageBitmap + canvasToBlob)
-├── src/sdk/browser.js + src/sdk/image-data.js   ← browser-safe IMAGE entries (core only)
-├── src/shared/imageProcessing.js + src/runtime/browser.js  ← browser-safe helpers
-└── direct dep: mediabunny ^1.46.0 (Input/Output/Sinks/Formats/canEncodeVideo)
+`lib/watermark/` owns detection, validation, and restoration, built from the
+frozen model (technique description only — no originality claimed):
 
-NODE-ONLY (must never enter the browser bundle)
-├── src/sdk/video.js                     ← node:path, node:fs, node:http, node:url; preview server, Playwright
-├── src/sdk/node.js                      ← node:path, node:fs/promises; sharp-injected decode/encode
-├── src/cli/ (gwrCli.js, gwrRemoveCommand.js), bin/, scripts/, tests/, examples/
-└── peer (optional): sharp ^0.34.5 || ^0.35.0 — CLI file codec only
+`watermarked = alpha * logo + (1 - alpha) * original`, therefore
+`original = (watermarked - alpha * logo) / (1 - alpha)`.
 
-OPTIONAL / HEAVY (browser-loadable but excluded from V1)
-├── src/core/allenkFdncnnOnnxRuntime.js  ← `import * as wasmOrt from 'onnxruntime-web/wasm'`
-├── src/core/allenkFdncnn*.js (denoise model code) + public/models/allenk-fdncnn/*.onnx
-└── dev: onnxruntime-web, playwright, esbuild, sharp, typescript
-```
+Modules: `profiles`, `detector`, `anchor` (local search), `validator`,
+`restoration`, `engine` (facade), `types`. The engine receives pixels +
+geometry and returns verdicts + restored pixels; it never sees `File`,
+`Blob`, React state, worker messaging, media-library objects, or DOM.
 
-Import-chain proof (representative): `videoExport.js` → `mediabunny` + `../core/blendModes.js` + `./videoWatermarkDetector.js` → `../core/{embeddedAlphaMaps,adaptiveDetector}.js` + `./videoWatermarkCatalog.js`. `watermarkEngine.js` → `embeddedAlphaMaps`, `multiPassRemoval`, `watermarkProcessor`, `adaptiveDetector`, `watermarkConfig` — all relative core files. `grep` for `node:` across `src/core src/video src/workers src/sdk src/shared src/runtime` returns hits **only** in `src/sdk/node.js` and `src/sdk/video.js`.
+## 3. Local detector
 
-## 3. Trusted engine boundary
+Sampled-frame scoring against candidate geometries: resolve candidates from
+display dimensions, score a bounded sample set (nominal: 12 timestamp-spread
+frames), aggregate per-candidate scores. Sampling bounds analysis cost so
+`ANALYZING` stays short; full-run per-frame scoring acts as backstop. Output
+is data (`WatermarkDetectionResult`), never pixels — the rail renders it
+verbatim and restoration consumes only validated geometry.
 
-- **Files that ARE the boundary:** `src/core/blendModes.js` (`removeWatermark`), `src/core/watermarkEngine.js` (`WatermarkEngine`), `src/core/watermarkProcessor.js` (`processWatermarkImageData`), `src/core/adaptiveDetector.js`, `src/core/geminiSizeCatalog.js`, `src/core/embeddedAlphaMaps.js` (+ siblings), `src/video/videoWatermarkDetector.js`, `src/video/videoWatermarkCatalog.js`, `src/video/videoMetadata.js`, `src/video/videoDecodeRecovery.js`.
-- **Existing browser-safe entry?** For **images**, yes: `./image-data` and `./browser` export subpaths. For **video**, **no** — `./video` maps to the Node-only `src/sdk/video.js`. So the video path has no consumable package entry; the video engine must be reached via vendored files (see §10), not via any export subpath.
-- **Worker precedent:** `src/workers/watermarkWorker.js` proves the engine runs off-main-thread (image path: `createImageBitmap` + engine + `canvasToBlob`, transferable result buffer). Our pipeline worker extends this pattern to video.
-- **Canvas fallback note:** `watermarkEngine.js:19-24` prefers `OffscreenCanvas`, falls back to `document.createElement('canvas')` — inside a Dedicated Worker `document` does not exist, so the worker path **requires** `OffscreenCanvas` (capability-gated; Chromium OK, Safari verified at runtime per §5).
+## 4. Local profiles
 
-## 4. Media pipeline
+Known size/position profiles as local data with provenance notes (e.g.
+96×96 @ +64/+64 for larger outputs, 48×48 @ +32/+32 for smaller). Profiles
+are data, not code: adding or correcting a profile is a data change with a
+fixture test, never an algorithm change. Unknown dimensions resolve to no
+confident candidate rather than an invented one.
 
-Traced `File → demux → frame → process → encode → audio → mux` in `src/video/videoExport.js` (`removeGeminiVideoWatermark`):
+## 5. Local anchor search
 
-1. **Demux:** `new Input({ source: new BlobSource(file), formats: ALL_FORMATS })` (`videoExport.js:88-94`); `getVideoContext` yields `input` + primary `videoTrack`.
-2. **Metadata:** `resolveVideoMetadata` (`videoMetadata.js`) — display w/h, first timestamp, codec, duration (metadata → computed → null), packet-stats average rate/bitrate, nullable `frameCountEstimate`.
-3. **Detect:** `detectGeminiVideoWatermark` — candidate positions from `resolveVideoWatermarkCandidates(w, h)`, 12 timestamp-spread samples (`DEFAULT_SAMPLE_COUNT = 12`, `getSampleTargetTimestamps`), `VideoSampleSink` draws → ROI `ImageData` → async scoring (5 alpha-refinement rounds, thresholds 0.14/0.035); low confidence **throws** unless `allowLowConfidence` (maps to our `NO_WATERMARK`).
-4. **Encode setup:** `createVideoExportEncodingConfig` → `canEncodeVideo('avc', …)` gate (failure = named Chrome/Edge error); `BufferTarget` + `Mp4OutputFormat({ fastStart: 'in-memory' })` + `CanvasSource(canvas, config)`; `output.addVideoTrack(source, { frameRate })`.
-5. **Frame loop:** `iterateVideoSamplesWithDecoderRecovery(() => new VideoSampleSink(videoTrack))` → per sample: normalize timestamp vs `firstTimestamp`, clamp regressions with `fallbackDuration`, draw full frame, ROI `getImageData` → core restore → `putImageData` → `source.add(timestamp, duration)`; `sample.close()` in `finally`; `AbortSignal` checked per frame; progress = time-based if duration known else frame-estimate-based (`export` phase callback).
-6. **Audio:** `prepareAudioPacketCopy` — primary audio track, MP4-compatible codec only, `EncodedAudioPacketSource` + `EncodedPacketSink` copy on the same normalized clock; runs concurrently (`copyAudioPackets`), failures fail the export; skip reasons recorded.
-7. **Mux/finalize:** `source.close()` → await audio → `output.finalize()` → assert `target.buffer` non-empty → `new Blob([buffer], { type: 'video/mp4' })`; catch path cancels un-finalized output and disposes input.
+Pixel-level refinement around each predicted region on sampled frames:
+measure local fit (e.g. residual energy under the hypothesized alpha support),
+keep the offset with the best aggregate score, and record the offset
+(`dx`, `dy`) in the detection report so the UI can display it honestly.
+Search windows stay small and bounded — refinement is local by design.
 
-**Required mediabunny APIs:** `Input, BlobSource, ALL_FORMATS, VideoSampleSink, Output, Mp4OutputFormat, BufferTarget, CanvasSource, EncodedAudioPacketSource, EncodedPacketSink, canEncodeVideo` (+ `getPrimaryAudioTrack/getDecoderConfig/computePacketStats` track methods).
-**Worker-executable:** the entire chain is worker-safe in principle (WebCodecs `VideoDecoder/Encoder` under mediabunny run in workers; `OffscreenCanvas` + 2d context required; no DOM used in `videoExport.js` — `createRuntimeCanvas` prefers `OffscreenCanvas`). Upstream runs it on the page thread with `yieldToMainThread`; moving it into a Dedicated Worker is the HLD/LLD delta, gated on the §5 capability probe. `ffmpeg` is **not** needed — unanimously mediabunny + WebCodecs.
+## 6. Local validation
 
-## 5. Browser/Worker boundary
+Tier assignment gates everything downstream: CONFIDENT (proceed),
+UNCERTAIN (proceed flagged with a `VERIFY EDGES` caution), NONE (→
+`NO_WATERMARK`: no encode pass runs, no output artifact exists, the source
+is byte-identical). Validation metrics also feed the canvas-interference
+error path (wrong pixels from fingerprint-defending extensions surface as a
+named error with the disable-extension fix, not as silent corruption).
 
-- Main thread: React, controller, playback, compare, object URLs. Worker: demux → detect → restore → encode → mux; messages per `docs/LLD.md` protocol; transferable final bytes.
-- Upstream precedent supports this: worker file exists (image path), video path is main-thread only upstream (`yieldToMainThread` option) but uses no main-thread-only APIs — migration risk is low, verification is runtime capability probing (`Worker`, `OffscreenCanvas`, `canEncodeVideo('avc', …)`), with `E-CAPABILITY` failure naming the missing piece.
-- COOP/COEP headers are **not** required for V1 (only the excluded threaded-ONNX path needs `SharedArrayBuffer`).
+## 7. Local inverse-alpha restoration
 
-## 6. Codec support matrix (V1 contract)
+Per-pixel solve of the frozen model over the validated ROI only, identical
+dimensions in/out, source `ImageData` never mutated (fresh output buffer).
+Alpha edge cases (0, 1, out-of-range, degenerate geometry) are handled by
+specification: clamp by rule, reject degenerate geometry in the validator
+before this stage. Correctness is proven by mathematical tests (hand-computed
+values) and synthetic fixtures (locally composited watermarked frames with
+known alpha/logo restored against the known original within tolerance).
+
+## 8. Mediabunny media pipeline
+
+`File → demux → decoded frame → detection/analysis → restoration → encoded frame → mux → output`, using mediabunny as the sole media dependency
+(`Input`, `BlobSource`, `VideoSampleSink`, `Output`, `Mp4OutputFormat`,
+`BufferTarget`, `CanvasSource`, `EncodedAudioPacketSource`,
+`EncodedPacketSink`, `canEncodeVideo`). The sample-sink model gives exact
+frames plus `timestamp/duration` pairs — required for honest progress and
+A/V correctness; raw `<video>` + captureStream cannot provide this. No
+FFmpeg anywhere; WebCodecs under mediabunny run in workers.
+
+## 9. Dedicated worker
+
+All decode/detect/restore/encode work runs in one single-job Dedicated
+Worker (`validate → analyze → restore → mux`); the main thread keeps React,
+controller, playback, and compare. `postMessage` protocol with `jobId` +
+generation + `seq` zombie guards; transferable `ArrayBuffer` for the final
+bytes; progress throttled (~10 Hz) with phase transitions bypassing the
+throttle. Workers are terminated after use, never reused. The worker path
+requires `OffscreenCanvas` (capability-gated; no `document` in workers).
+
+## 10. Codec capability probing
+
+V1 contract — MP4/H.264 in → MP4/H.264 out; MOV/WebM and HEVC/VP9 are
+best-effort behind probes, never promised:
 
 | Direction | Contract | Runtime check | On failure |
 |---|---|---|---|
-| Input container | MP4 primary; MOV/WebM best-effort (whatever mediabunny demuxes) | `Input` open + video track present | `UNSUPPORTED` naming container |
-| Input video | H.264/AVC primary; HEVC/VP9 best-effort (browser decode) | track `getCodec()` + decode probe | `E-UNSUPPORTED-CODEC` naming codec |
-| Output | MP4 + H.264/AVC only | `canEncodeVideo('avc', {w,h,bitrate,…})` pre-restore | `ERROR` quoting upstream message (use modern Chrome/Edge) |
-| Audio | copy-if-compatible, else omit + reason | `getSupportedAudioCodecs().includes(codec)` | omit with `skipReason`, stated in ledger |
+| Input container | MP4 primary; MOV/WebM best-effort | `Input` open + video track present | `UNSUPPORTED` naming container |
+| Input video | H.264/AVC primary; HEVC/VP9 best-effort | track codec + decode probe | `E-UNSUPPORTED-CODEC` naming codec |
+| Output | MP4 + H.264/AVC only | `canEncodeVideo('avc', {w,h,bitrate,…})` pre-restore | `ERROR` with the missing capability named |
+| Audio | copy-if-compatible, else omit + reason | container audio-codec support check | omit with `skipReason`, stated in ledger |
 
-Primary target per brief: **MP4/H.264 in → MP4/H.264 out**. No universal-support claims; Safari/HEVC behavior is probe-determined at runtime, not asserted in docs or UI. Upstream's own encode-failure string is Chrome/Edge-first — our support statement matches: **V1 targets current Chrome/Edge; other browsers best-effort behind the same probes.**
+V1 targets current Chrome/Edge; other browsers are best-effort behind the
+same probes. No universal-support claims in docs or UI.
 
-## 7. Audio strategy
+## 11. Audio handling
 
-Unchanged from HLD/LLD, now repo-confirmed: primary-track **encoded-packet copy** with start-timestamp normalization, concurrent with video; skip reasons `no-audio-track / unsupported-audio-codec / no-audio-packets / disabled`; no transcode in V1; ledger states outcome (`Audio: copied (aac, 96 packets)` or `Audio: omitted — <reason>`). Silent and audio-less sources both valid.
+Primary-track **encoded-packet copy** with start-timestamp normalization,
+concurrent with video; skip reasons `no-audio-track /
+unsupported-audio-codec / no-audio-packets / disabled`. No transcode, no
+resample in V1. The export ledger states the outcome
+(`Audio: copied (aac, 96 packets)` or `Audio: omitted — <reason>`); silent
+and audio-less sources are both valid.
 
-## 8. Output strategy
+## 12. BufferTarget V1 output
 
-V1 reproduces the calibrated profile exactly (values from `videoExport.js:44-64,125-138`): codec `avc`, **12 000 000 bps CBR** (`resolveVideoBitrate` fallback), `keyFrameInterval: 2`, `latencyMode: 'quality'`, `bitrateMode: 'constant'`, `hardwareAcceleration: 'no-preference'`, `contentHint: 'detail'`, `alpha: 'discard'`, decoder color-space override BT.709 limited-range (`primaries/transfer/matrix: bt709, fullRange: false`), `Mp4OutputFormat({ fastStart: 'in-memory' })`. **No bitrate selector in V1** (fixed constant; `resolveVideoBitrate` honors overrides only if a future caller passes one).
+Fixed export profile, no user selector in V1: codec `avc`, **12 000 000 bps
+CBR**, `keyFrameInterval: 2`, `latencyMode: 'quality'`, `bitrateMode:
+'constant'`, `hardwareAcceleration: 'no-preference'`, `contentHint:
+'detail'`, `alpha: 'discard'`, BT.709 limited-range color
+(`primaries/transfer/matrix: bt709, fullRange: false`),
+`Mp4OutputFormat({ fastStart: 'in-memory' })`. Whole output accumulates in a
+`BufferTarget`; `COMPLETE` publishes only after explicit mux finalize plus a
+non-empty-bytes assertion (`new Blob([buffer], { type: 'video/mp4' })`).
+Chunked/streaming output is a future extension behind the same transferable-
+bytes `complete` event, not a V1 concern.
 
-## 9. Memory strategy
+## 13. Memory strategy
 
-- **Upstream model (A — whole output in memory):** `BufferTarget` accumulates the full MP4; final `Blob([buffer])`. Simple, proven, and the V1 choice: no extra APIs, deterministic finalize, matches reference byte-for-byte behavior.
-- **B (chunked/progressive):** viable later (emit encoded chunks to controller for incremental assembly) but changes finalize semantics — deferred.
-- **C (`FileSystemWritableFileStream`/OPFS):** cannot be confirmed from the repo (mediabunny typings unavailable offline — `node_modules` absent) and adds permission/persistence semantics; deferred pending implementation-time verification against installed mediabunny types.
-- **V1:** (A) + existing guards (ROI-only work, reused canvas, per-frame `sample.close()`, bounded live frames, URL registry). Large-file path stays architecturally open via the transferable-bytes protocol (a future `StreamTarget` can replace `BufferTarget` behind the same `complete` event).
+Incremental by construction: bounded live frames (current + encoder
+in-flight, never the whole video), ROI-only pixel work, reused canvases
+(not reallocated per frame), per-frame sample close, object-URL registry
+with revocation on reset/cancel/replace/unmount. Memory scales with
+duration at fixed output size — not with resolution² × frames. Large-file
+streaming targets remain architecturally open but unverified; V1 depends
+only on `BufferTarget`.
 
-## 10. Reuse strategy comparison
+## 14. Browser compatibility
 
-| Criterion | A. npm dependency | B. vendored snapshot | C. adapter over vendored core (recommended) |
-|---|---|---|---|
-| Browser compat | Blocked: no video-safe entry (`./video` is Node-only); would import `node:http` into bundle | Full control; import only verified-safe files | Same as B, plus isolation |
-| Behavioral equivalence | Version drift risk on every install | Exact — pinned files, reproducible bytes | Exact + adapter covered by parity tests |
-| Maintenance | Upstream churn arrives unreviewed | Manual sync, deliberate + logged | Manual sync behind a stable port (fewer touch points) |
-| Upstream updates | Automatic but unsafe | Conscious cherry-pick | Same as B; port absorbs API-shape drift |
-| Bundle size | Whole package graph incl. Node shims risk | Only needed files (core subset + video pipeline) | Same as B; adapter is trivial |
-| Dependency risk | `node:` poisoning, sharp/peer confusion | None beyond mediabunny | None beyond mediabunny |
-| Reproducibility | Lockfile-dependent, entry-point-dependent | Commit-pinned, diffable | Commit-pinned + interface-frozen |
-| Learning value | Low (black box) | High (boundary explicitly mapped) | Highest (port documents the contract) |
-| License/attribution | MIT — preserve `LICENSE` notices (upstream © 2025 Jad, © 2024 AllenK/Kwyshell) + credit the port + doc source in HLD/LLD | Same obligations, easier to evidence (vendored `NOTICE`/`THIRD-PARTY` note) | Same as B |
+Chrome/Edge current: full pass expected (MP4/H.264 in→out, audio copy,
+short 4K). Firefox/Safari: probe-gated results recorded during Phase 16 —
+pass or named `E-CAPABILITY`/`UNSUPPORTED` are both correct outcomes when
+truthful. Known risk areas: Safari `OffscreenCanvas`/WebCodecs gaps and
+HEVC/VP9 decode variance; both are handled by truthful gating, never
+polyfill heroics without approval, and never UA sniffing. COOP/COEP headers
+are not required (no `SharedArrayBuffer` path in V1).
 
-**Recommendation for V1: C.** Vendor the §3 file set at a pinned upstream commit, wrap in `WatermarkEnginePort`, and forbid all other imports from vendored paths (lint rule). MIT obligations: retain upstream copyright notices, add attribution + commit hash in a vendored `README/NOTICE`.
+## 15. Performance risks
 
-## 11. Denoise/ONNX findings
+- `fastStart: 'in-memory'` pressure on very large outputs — acceptable under
+  guidance-only UX copy; revisit with a streaming target only on evidence.
+- Long-video tab throttling/sleep → `E-INTERRUPTED` + retry-from-start (no
+  resume claim); real-world timing data pending.
+- 4K encode cost varies by hardware acceleration availability; the probe
+  gates honestly, and throughput (`fps`, elapsed) is displayed instead of
+  speed promises.
+- Progress stays honest throughout: time-based when duration is known,
+  frame-estimate-based otherwise, `N frames so far` when totals are unknown.
 
-- **Not on the normal path:** `DEFAULT_DENOISE_BACKEND = 'none'` (`videoCleanupBackends.js:15`); the async ONNX branch (`ALLENK_FDNCNN_BROWSER_SPIKE`, `applyVideoResidualCleanupAsync`) executes only when explicitly selected; default cleanup is inline canvas residual/texture work at `residualCleanupStrength 1.5`, `highQualityCleanup false`, `textureRepair false`.
-- **V1 operates correctly without it:** detection (catalog + anchor + validation) and `removeWatermark` ROI restoration are ONNX-independent; the WASM module import lives only in `allenkFdncnnOnnxRuntime.js`, never imported by the default export path.
-- **Where degradation could appear without ONNX:** heavy-compression or textured watermark footprints where the optional `canvas-edge-denoise / footprint-polish / temporal-stabilize` backends would otherwise smooth residual edges — visible only as marginally less-polished ROI edges on close 100 % inspection, never as job failure. Mitigation: ship canvas cleanups at their defaults; keep `TIER 3 — VERIFY EDGES` caution; revisit only with side-by-side evidence.
-- **Stays disabled:** no `onnxruntime-web` dependency, no `.onnx` model hosting, no COOP/COEP work in V1.
+## 16. Denoise/ONNX excluded from V1
 
-## 12. Open risks
+No model-based cleanup backends in V1: no `onnxruntime` dependency, no model
+hosting, no WASM threading work. Restoration quality rests on the
+inverse-alpha solve plus specified local cleanup at documented defaults;
+heavily compressed or textured regions are covered by the UNCERTAIN tier +
+`VERIFY EDGES` caution and close-inspection tooling (100% zoom,
+frame-step), not by heavier models. Revisit only with side-by-side evidence.
 
-1. **Vendoring fidelity:** transcription/drift when snapshotting upstream files — mitigate with pinned commit + parity tests against reference outputs.
-2. **Safari worker + `OffscreenCanvas`/WebCodecs gaps** — mitigated by capability probes + Chrome/Edge-first contract; needs device testing at implementation.
-3. **HEVC/VP9 input variance** across browsers — probe-gated, allowlist-worded, never promised.
-4. **mediabunny streaming-target API surface** unverified offline — V1 avoids dependence on it (`BufferTarget` only).
-5. **Long-video tab throttling/sleep** — `E-INTERRUPTED` + retry-from-start path already designed; real-world timing data pending.
-6. **`fastStart: 'in-memory'`** cost on very large outputs — acceptable under V1 guidance (§13); revisit with streaming target if evidence demands.
+## 17. Open risks that remain relevant
 
-## 13. Final V1 technical recommendations
+1. **Engine correctness ownership:** we prove it (math + synthetic +
+   regression tests in Phase 1) instead of inheriting proof — more upfront
+   test work, zero runtime coupling.
+2. **Profile coverage:** real-world watermarks outside the local profile
+   table resolve to UNCERTAIN/NONE rather than guessed geometry — correct
+   but conservative; profile additions follow the data-change process.
+3. **Safari worker/`OffscreenCanvas`/WebCodecs gaps** — capability probes +
+   Chrome/Edge-first contract; device testing in Phase 16.
+4. **HEVC/VP9 input variance** — probe-gated, allowlist-worded, never promised.
+5. **Long-video interruption** — designed path exists; timing evidence pending.
+6. **`fastStart: 'in-memory'`** on huge outputs — acceptable per §13/§15;
+   streaming target only on evidence.
 
-1. Vendored core snapshot + `WatermarkEnginePort` adapter (approach C), MIT attribution retained.
-2. mediabunny as the sole media dependency; no FFmpeg; no ONNX/denoise backends.
-3. Dedicated pipeline worker; `BufferTarget` whole-output model; transferable-bytes `complete` event.
-4. Fixed 12 Mbps AVC/BT.709/2 s-keyframe export; audio copy-or-stated-skip; no bitrate UI.
-5. Chrome/Edge-first contract; probes decide everything else; failures name the missing capability.
-6. Practical UX guidance (not caps): short clips fly; multi-minute/4K works but takes minutes and peaks near output-size memory — progress stays honest throughout. No hard size/duration block.
+## 18. FROZEN decisions
 
-## 14. FROZEN decisions
-
-- F1. Trusted math is vendored, never rewritten; UI ↔ engine communication only via `WatermarkDetectionResult` + ROI pixels.
-- F2. No `node:`, `sharp`, CLI, userscript, or network media transfers in browser code — ever.
+- F1. The mathematical model is frozen as stated in §2; the engine is local
+  code; UI ↔ engine communication is `WatermarkDetectionResult` + ROI
+  pixels only.
+- F2. No `node:`, `sharp`, CLI, userscript, or network media transfers in
+  browser code — ever. No external watermark-removal code under any path.
 - F3. No backend/database/auth/storage/API for the job path.
-- F4. Export = MP4/AVC 12 Mbps CBR, BT.709, 2 s keyframes, `fastStart in-memory`; audio copy-or-skip-reason; no V1 bitrate setting.
-- F5. Denoise/ONNX excluded from V1; default canvas cleanups only.
-- F6. Incremental frame flow; ROI-only restoration; nullable totals/ETA stay null; `COMPLETE` only after verified non-empty mux finalize.
-- F7. Single-job workers, terminated after use, zombie-guarded events; cancellation revokes partial URLs, keeps source, declares no-resume.
-- F8. Support contract targets MP4/H.264 in → MP4/H.264 out, Chrome/Edge-first; everything else is probe-gated best-effort resolving to `UNSUPPORTED`/`E-CAPABILITY`.
+- F4. Export = MP4/AVC 12 Mbps CBR, BT.709, 2 s keyframes, `fastStart
+  in-memory`; audio copy-or-skip-reason; no V1 bitrate setting.
+- F5. Model-based denoise excluded from V1.
+- F6. Incremental frame flow; ROI-only restoration; nullable totals/ETA stay
+  null; `COMPLETE` only after verified non-empty mux finalize.
+- F7. Single-job workers, terminated after use, zombie-guarded events;
+  cancellation revokes partial URLs, keeps source, declares no-resume.
+- F8. Support contract targets MP4/H.264 in → MP4/H.264 out,
+  Chrome/Edge-first; everything else is probe-gated best-effort resolving
+  to `UNSUPPORTED`/`E-CAPABILITY`.
 - F9. No hard file-size/duration caps; guidance-only UX copy.

@@ -1,7 +1,7 @@
 # Video Restoration Utility — Design Directions
 
 **Project:** Browser-based video restoration utility (local, client-side processing).
-**Reference algorithm:** Reverse Alpha Blending implementation from `GargantuaX/gemini-watermark-remover` — trusted, do not redesign.
+**Reference algorithm:** Reverse Alpha Blending implementation from the technical reference implementation studied during research — trusted, do not redesign.
 **Stack observed:** Next.js 16.3.8 (App Router) + React 19 + Tailwind CSS v4 (`@import "tailwindcss"`, `@theme inline`), Geist / Geist Mono via `next/font`, single-route tool (`app/page.tsx`, `app/layout.tsx`, `app/globals.css`). No application UI exists yet — clean scaffold.
 **Workflow (from reference repo):** select compatible video → validate locally → auto-detect watermark (size-catalog lookup + anchor search + restoration validation) → process frame-by-frame in browser (nothing uploaded) → show deterministic progress → produce restored file → compare original vs. restored → download. Failure modes are real: unsupported codec/container, corrupt file, no detectable watermark, processing interruption, fingerprint-defender / Canvas-API interference.
 **Status of this document:** Exploration only. No implementation. No application files modified.
